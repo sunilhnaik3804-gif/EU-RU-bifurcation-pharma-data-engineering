@@ -1,0 +1,22 @@
+[
+  {
+    "salesid": 1001,
+    "hcpid": 101,
+    "hcp_name": "Doctor A",
+    "city": "Berlin",
+    "region": "EU",
+    "repid": 501,
+    "product": "Product_A",
+    "qty": 20
+  },
+  {
+    "salesid": 1002,
+    "hcpid": 102,
+    "hcp_name": "Doctor B",
+    "city": "Moscow",
+    "region": "RU",
+    "repid": 502,
+    "product": "Product_B",
+    "qty": 15
+  }
+]
