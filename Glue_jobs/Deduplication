@@ -1,0 +1,5 @@
+hcp_df = hcp_df.dropDuplicates(["hcpid"])
+
+sales_df = sales_df.dropDuplicates(["salesid"])
+
+visits_df = visits_df.dropDuplicates(["visit_id"])
