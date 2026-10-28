@@ -1,0 +1,317 @@
+# ============================================================
+# PROJECT: EU-RU PHARMA DATA ENGINEERING
+# STEP 5: DATA QUALITY VALIDATION & MONITORING
+# ============================================================
+
+import sys
+import json
+import logging
+from datetime import datetime, timezone
+
+import boto3
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+
+
+# ============================================================
+# 1. AWS GLUE JOB ARGUMENTS
+# ============================================================
+
+args = getResolvedOptions(
+    sys.argv,
+    [
+        "JOB_NAME",
+        "EU_RAW_BUCKET",
+        "PROCESSED_BUCKET",
+        "BATCH_ID",
+        "SNS_TOPIC_ARN"
+    ]
+)
+
+EU_RAW_BUCKET = args["EU_RAW_BUCKET"]
+PROCESSED_BUCKET = args["PROCESSED_BUCKET"]
+BATCH_ID = args["BATCH_ID"]
+SNS_TOPIC_ARN = args["SNS_TOPIC_ARN"]
+
+
+# ============================================================
+# 2. INITIALIZE SPARK AND AWS CLIENTS
+# ============================================================
+
+spark = (
+    SparkSession.builder
+    .appName("EU_Pharma_Data_Quality")
+    .config("spark.sql.adaptive.enabled", "true")
+    .getOrCreate()
+)
+
+glue_context = GlueContext(spark.sparkContext)
+
+job = Job(glue_context)
+job.init(args["JOB_NAME"], args)
+
+sns = boto3.client("sns")
+s3 = boto3.client("s3")
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+
+# ============================================================
+# 3. DEFINE DATASET CONFIGURATION
+# ============================================================
+
+DATASETS = {
+    "hcp_profile": {
+        "business_key": "hcpid",
+        "required_columns": [
+            "hcpid", "hcp_name", "region"
+        ]
+    },
+    "sales": {
+        "business_key": "salesid",
+        "required_columns": [
+            "salesid", "hcpid", "amount",
+            "sales_date", "region"
+        ]
+    },
+    "visits": {
+        "business_key": "visit_id",
+        "required_columns": [
+            "visit_id", "hcpid",
+            "visit_date", "region"
+        ]
+    },
+    "territory": {
+        "business_key": "hcpid",
+        "required_columns": [
+            "hcpid", "territory_id", "region"
+        ]
+    }
+}
+
+
+# ============================================================
+# 4. DEFINE S3 PATHS
+# ============================================================
+
+BRONZE_BASE = (
+    f"s3://{EU_RAW_BUCKET}/bronze/region=EU"
+)
+
+SILVER_BASE = (
+    f"s3://{PROCESSED_BUCKET}/silver"
+)
+
+
+def bronze_path(dataset):
+
+    return (
+        f"{BRONZE_BASE}/{dataset}/"
+        f"batch_id={BATCH_ID}/{dataset}.json"
+    )
+
+
+def silver_path(dataset):
+
+    return (
+        f"{SILVER_BASE}/{dataset}/"
+        f"batch_id={BATCH_ID}/"
+    )
+
+
+# ============================================================
+# 5. DATA QUALITY VALIDATION FUNCTION
+# ============================================================
+
+def validate_dataset(dataset, config):
+
+    logger.info("Validating dataset: %s", dataset)
+
+    raw_df = spark.read.json(bronze_path(dataset))
+
+    silver_df = spark.read.parquet(
+        silver_path(dataset)
+    )
+
+    raw_count = raw_df.count()
+    silver_count = silver_df.count()
+
+    errors = []
+
+    # Schema Validation
+    missing_columns = [
+        column
+        for column in config["required_columns"]
+        if column not in silver_df.columns
+    ]
+
+    if missing_columns:
+        errors.append(
+            f"Missing columns: {missing_columns}"
+        )
+
+    # Business Key Validation
+    business_key = config["business_key"]
+
+    if business_key in silver_df.columns:
+
+        null_key_count = silver_df.filter(
+            F.col(business_key).isNull()
+        ).count()
+
+        if null_key_count > 0:
+            errors.append(
+                f"Null business keys: {null_key_count}"
+            )
+
+        duplicate_count = (
+            silver_df.groupBy(business_key)
+            .count()
+            .filter(F.col("count") > 1)
+            .count()
+        )
+
+        if duplicate_count > 0:
+            errors.append(
+                f"Duplicate business keys: {duplicate_count}"
+            )
+
+    # EU Region Validation
+    if "region" in silver_df.columns:
+
+        invalid_region_count = silver_df.filter(
+            F.col("region").isNull()
+            | (F.col("region") != "EU")
+        ).count()
+
+        if invalid_region_count > 0:
+            errors.append(
+                f"Invalid EU records: {invalid_region_count}"
+            )
+
+    # Record Count Reconciliation
+    if silver_count > raw_count:
+        errors.append(
+            "Silver count exceeds Bronze count"
+        )
+
+    result = {
+        "dataset": dataset,
+        "raw_count": raw_count,
+        "processed_count": silver_count,
+        "rejected_count": max(
+            raw_count - silver_count, 0
+        ),
+        "status": "PASS" if not errors else "FAIL",
+        "errors": errors
+    }
+
+    logger.info(
+        "Validation result: %s",
+        json.dumps(result)
+    )
+
+    return result
+
+
+# ============================================================
+# 6. RUN ALL DATA QUALITY CHECKS
+# ============================================================
+
+results = []
+
+for dataset, config in DATASETS.items():
+
+    result = validate_dataset(
+        dataset,
+        config
+    )
+
+    results.append(result)
+
+
+# ============================================================
+# 7. BUILD VALIDATION SUMMARY
+# ============================================================
+
+failed_datasets = [
+    result
+    for result in results
+    if result["status"] == "FAIL"
+]
+
+summary = {
+    "project": "EU-RU Pharma Bifurcation",
+    "region": "EU",
+    "batch_id": BATCH_ID,
+    "validation_time": datetime.now(
+        timezone.utc
+    ).isoformat(),
+    "overall_status": (
+        "FAIL" if failed_datasets else "PASS"
+    ),
+    "datasets": results
+}
+
+
+# ============================================================
+# 8. SAVE VALIDATION REPORT TO S3
+# ============================================================
+
+report_key = (
+    f"reports/data_quality/"
+    f"batch_id={BATCH_ID}/"
+    f"validation_report.json"
+)
+
+s3.put_object(
+    Bucket=PROCESSED_BUCKET,
+    Key=report_key,
+    Body=json.dumps(summary, indent=2),
+    ContentType="application/json"
+)
+
+logger.info(
+    "Data quality report stored: s3://%s/%s",
+    PROCESSED_BUCKET,
+    report_key
+)
+
+
+# ============================================================
+# 9. SEND SNS ALERT IF VALIDATION FAILS
+# ============================================================
+
+if failed_datasets:
+
+    sns.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject="EU Pharma Data Quality Failed",
+        Message=json.dumps(summary, indent=2)
+    )
+
+    logger.error(
+        "Data quality validation failed"
+    )
+
+    raise ValueError(
+        "Data quality checks failed. "
+        "Downstream processing must stop."
+    )
+
+
+# ============================================================
+# 10. COMPLETE GLUE JOB
+# ============================================================
+
+logger.info(
+    "All EU Pharma data quality checks passed"
+)
+
+job.commit()
