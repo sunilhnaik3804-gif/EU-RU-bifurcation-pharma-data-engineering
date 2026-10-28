@@ -1,0 +1,18 @@
+[
+  {
+    "hcpid": 101,
+    "hcp_name": "Dr John",
+    "specialization": "CARD",
+    "city": "Berlin",
+    "region": "EU",
+    "status": "ACTIVE"
+  },
+  {
+    "hcpid": 103,
+    "hcp_name": "Dr Maria",
+    "specialization": "NEUROLOGY",
+    "city": "Paris",
+    "region": "EU",
+    "status": "ACTIVE"
+  }
+]
