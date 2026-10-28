@@ -1,0 +1,263 @@
+import json
+import os
+import re
+import csv
+import io
+import logging
+import boto3
+
+from urllib.parse import unquote_plus
+
+# AWS Clients
+s3 = boto3.client("s3")
+sns = boto3.client("sns")
+sfn = boto3.client("stepfunctions")
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Environment Variables
+EU_BUCKET = os.environ["EU_RAW_BUCKET"]
+ERROR_BUCKET = os.environ["ERROR_BUCKET"]
+SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
+
+# Allowed Formats
+ALLOWED_FORMATS = (".csv", ".json", ".parquet")
+
+# Expected Schemas
+EXPECTED_SCHEMAS = {
+    "sales": {
+        "salesid", "hcpid", "region",
+        "repid", "product", "qty"
+    },
+    "hcp_profile": {
+        "hcpid", "hcp_name", "region"
+    },
+    "territory": {
+        "hcpid", "territory_id", "region"
+    },
+    "visits": {
+        "visit_id", "hcpid", "repid", "region"
+    },
+    "marketing": {
+        "campaign_id", "product", "region"
+    }
+}
+
+
+def validate_file_name(key):
+
+    pattern = (
+        r"^bronze/region=EU/"
+        r"(sales|hcp_profile|territory|visits|marketing)/"
+        r"batch_id=\d{14}/"
+        r"\1\.(csv|json|parquet)$"
+    )
+
+    if not re.fullmatch(pattern, key):
+        raise ValueError("Invalid file name or S3 path")
+
+    return key.split("/")[2]
+
+
+def validate_file_size(bucket, key):
+
+    metadata = s3.head_object(
+        Bucket=bucket,
+        Key=key
+    )
+
+    file_size = metadata["ContentLength"]
+
+    if file_size <= 0:
+        raise ValueError("Empty file detected")
+
+    # 100 MB maximum for Lambda-side validation
+    if file_size > 100 * 1024 * 1024:
+        raise ValueError(
+            "File exceeds Lambda validation limit"
+        )
+
+    return file_size
+
+
+def validate_schema(bucket, key, dataset):
+
+    response = s3.get_object(
+        Bucket=bucket,
+        Key=key
+    )
+
+    content = response["Body"].read()
+
+    expected = EXPECTED_SCHEMAS[dataset]
+
+    if key.endswith(".json"):
+
+        records = json.loads(content)
+
+        if not isinstance(records, list) or not records:
+            raise ValueError("Invalid or empty JSON data")
+
+        for record in records:
+
+            if not isinstance(record, dict):
+                raise ValueError("Invalid JSON record")
+
+            if not expected.issubset(record.keys()):
+                raise ValueError("JSON schema mismatch")
+
+            if record.get("region") != "EU":
+                raise ValueError("Non-EU record detected")
+
+    elif key.endswith(".csv"):
+
+        text = content.decode("utf-8-sig")
+
+        reader = csv.DictReader(
+            io.StringIO(text)
+        )
+
+        if not expected.issubset(
+            set(reader.fieldnames or [])
+        ):
+            raise ValueError("CSV schema mismatch")
+
+        count = 0
+
+        for record in reader:
+
+            count += 1
+
+            if record.get("region") != "EU":
+                raise ValueError("Non-EU record detected")
+
+        if count == 0:
+            raise ValueError("Empty CSV data")
+
+    elif key.endswith(".parquet"):
+
+        if (
+            len(content) < 12
+            or content[:4] != b"PAR1"
+            or content[-4:] != b"PAR1"
+        ):
+            raise ValueError("Invalid Parquet format")
+
+        # Full Parquet schema and region validation
+        # must be performed in Glue before Silver load.
+
+    return True
+
+
+def send_alert(key, error):
+
+    sns.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject="EU Pharma Validation Failed",
+        Message=json.dumps({
+            "file": key,
+            "status": "FAILED",
+            "reason": str(error)
+        })
+    )
+
+
+def move_to_error_bucket(bucket, key):
+
+    error_key = f"error/{key}"
+
+    s3.copy_object(
+        Bucket=ERROR_BUCKET,
+        CopySource={
+            "Bucket": bucket,
+            "Key": key
+        },
+        Key=error_key
+    )
+
+    s3.delete_object(
+        Bucket=bucket,
+        Key=key
+    )
+
+
+def lambda_handler(event, context):
+
+    results = []
+
+    for record in event.get("Records", []):
+
+        bucket = record["s3"]["bucket"]["name"]
+
+        key = unquote_plus(
+            record["s3"]["object"]["key"]
+        )
+
+        if bucket != EU_BUCKET:
+            continue
+
+        if not key.startswith("bronze/region=EU/"):
+            continue
+
+        try:
+            dataset = validate_file_name(key)
+
+            file_size = validate_file_size(
+                bucket, key
+            )
+
+            validate_schema(
+                bucket, key, dataset
+            )
+
+        except (
+            ValueError,
+            UnicodeError,
+            json.JSONDecodeError,
+            csv.Error
+        ) as error:
+
+            logger.warning(
+                "Invalid file %s: %s",
+                key,
+                error
+            )
+
+            move_to_error_bucket(
+                bucket, key
+            )
+
+            send_alert(key, error)
+
+            results.append({
+                "file": key,
+                "status": "INVALID"
+            })
+
+            continue
+
+        # Start downstream workflow only after
+        # successful validation.
+        sfn.start_execution(
+            stateMachineArn=STATE_MACHINE_ARN,
+            input=json.dumps({
+                "bucket": bucket,
+                "key": key,
+                "dataset": dataset,
+                "region": "EU",
+                "file_size": file_size
+            })
+        )
+
+        results.append({
+            "file": key,
+            "status": "VALID",
+            "workflow": "STARTED"
+        })
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps(results)
+    }
