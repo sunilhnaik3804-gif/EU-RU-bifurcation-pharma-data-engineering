@@ -1,0 +1,3 @@
+hcp_df = hcp_df.filter(
+    F.col("status") == "ACTIVE"
+)
