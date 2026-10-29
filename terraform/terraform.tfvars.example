@@ -1,0 +1,40 @@
+# AWS Configuration
+
+aws_region = "ap-south-1"
+environment = "dev"
+
+# Project
+
+project_name = "eu-ru-pharma"
+
+# IMPORTANT:
+
+# Replace these example names with globally unique S3 bucket names
+
+# before deploying to AWS.
+
+eu_raw_bucket = "replace-with-your-unique-eu-raw-bucket"
+ru_raw_bucket = "replace-with-your-unique-ru-raw-bucket"
+processed_bucket = "replace-with-your-unique-processed-bucket"
+error_bucket = "replace-with-your-unique-error-bucket"
+
+# AWS Glue Configuration
+
+glue_worker_type = "G.1X"
+glue_number_of_workers = 2
+
+# AWS Lambda Configuration
+
+lambda_timeout = 60
+lambda_memory_size = 256
+
+# SNS Notifications
+
+# Add a valid email address only when you want to configure alerts.
+
+notification_email = ""
+
+# Amazon Redshift
+
+redshift_database = "pharma_analytics"
+enable_redshift = false
