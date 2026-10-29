@@ -1,0 +1,4 @@
+hcp_id,doctor_name,city,territory,is_active,visit_date,product_id,sales_amount
+HCP001,Alex Morgan,Berlin,T-EU-01,true,2026-01-15,P-100,1250.50
+HCP002,Jamie Lee,Munich,T-EU-02,true,2026-01-18,P-200,980.00
+HCP003,Taylor Reed,Hamburg,T-EU-01,false,2025-12-02,P-100,400.00
